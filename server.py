@@ -1,73 +1,48 @@
 import copy
+
+import cv2
 import torch
-from tqdm import tqdm
-from detect_rec_plate import load_model, det_rec_plate
-from plate_recognition.plate_rec import init_model
+from plate_recognition.plate_rec import init_model, image_processing, get_plate_result
 
 
 class FedServer:
     def __init__(self):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Server using device: {self.device}")
-
-        # 完全使用原有模型加载方式
-        self.global_detector = load_model("weights/yolov8s.pt", self.device)
         self.global_recognizer = init_model(self.device, "weights/plate_rec_color.pth", is_color=True)
 
-        # 冻结YOLO基础层（保持原有检测模型特性）
-        for name, param in self.global_detector.named_parameters():
-            if 'model.24' not in name:  # 仅训练检测头
-                param.requires_grad = False
-            else:
-                param.requires_grad = True
-
-    def aggregate(self, client_updates):
-        """改进的聚合逻辑，保持原有模型结构"""
-        # 检测模型聚合
-        detector_state = copy.deepcopy(self.global_detector.state_dict())
-        for key in detector_state:
-            if 'model.24' in key:
-                detector_state[key] = torch.mean(
-                    torch.stack([update['detector'][key] for update in client_updates]), dim=0)
-        self.global_detector.load_state_dict(detector_state)
-
-        # 识别模型聚合（全参数平均）
-        recognizer_state = copy.deepcopy(self.global_recognizer.state_dict())
-        for key in recognizer_state:
-            if key in client_updates[0]['recognizer']:
-                recognizer_state[key] = torch.mean(
-                    torch.stack([update['recognizer'][key] for update in client_updates]), dim=0)
-        self.global_recognizer.load_state_dict(recognizer_state)
-
     def get_global_models(self):
-        return {
-            "detector": copy.deepcopy(self.global_detector.state_dict()),
-            "recognizer": copy.deepcopy(self.global_recognizer.state_dict())
-        }
+        return {"recognizer": copy.deepcopy(self.global_recognizer.state_dict())}
 
-    def evaluate(self, dataset):
-        """使用原有检测识别流程进行评估"""
-        self.global_detector.eval()
+    def aggregate(self, updates):
+        # FedAvg 聚合识别模型
+        new_state = copy.deepcopy(updates[0]["recognizer"])
+        for k in new_state.keys():
+            if torch.is_floating_point(new_state[k]):
+                for update in updates[1:]:
+                    new_state[k] += update["recognizer"][k].to(new_state[k].dtype)
+                new_state[k] /= len(updates)
+            else:
+                # 非浮点型参数（如int、long），直接取第一个
+                new_state[k] = updates[0]["recognizer"][k]
+        self.global_recognizer.load_state_dict(new_state)
+
+    def evaluate(self, testset):
         self.global_recognizer.eval()
-
-        correct = 0
-        total = 0
-        for item in tqdm(dataset, desc="Evaluating"):
-            try:
-                # 使用原有检测识别流程
-                result_list = det_rec_plate(
-                    item['image'],
-                    item['image'].copy(),
-                    self.global_detector,
-                    self.global_recognizer
-                )
-                if result_list:
-                    pred = result_list[0]
-                    if (pred['plate_no'] == item['plate_number'] and
-                            pred['plate_color'] == item['plate_color']):
-                        correct += 1
+        correct, total = 0, 0
+        with torch.no_grad():
+            for item in testset:
+                img = item["image"]
+                x1, y1, x2, y2 = item["bbox"]
+                roi = img[y1:y2, x1:x2]
+                if roi.size == 0:
+                    continue
+                if len(roi.shape) == 2:
+                    roi = cv2.cvtColor(roi, cv2.COLOR_GRAY2BGR)
+                elif roi.shape[2] == 4:
+                    roi = roi[:, :, :3]
+                processed = image_processing(roi, self.device)
+                plate, _, color, _ = get_plate_result(roi, self.device, self.global_recognizer, is_color=True)
+                if plate == item["plate_number"]:
+                    correct += 1
                 total += 1
-            except Exception as e:
-                print(f"Evaluation error: {e}")
-                continue
-        return correct / total if total > 0 else 0.0
+        return correct / total if total else 0.0
