@@ -96,23 +96,37 @@ class FedClient:
         if self.device.type == 'cuda':
             torch.cuda.reset_peak_memory_stats()
 
-        # 加载全局参数
+        # 参数加载增强校验
         global_params = self.server.get_global_models()
         try:
+            # 参数名称匹配校验
+            detector_keys = set(self.local_detector.state_dict().keys())
+            received_det_keys = set(global_params["detector"].keys())
+            if detector_keys != received_det_keys:
+                print(
+                    f"检测器参数不匹配: 缺失 {detector_keys - received_det_keys} 多余 {received_det_keys - detector_keys}")
+                return None
+
+            # 类型和形状校验
+            for k, v in global_params["detector"].items():
+                if v.shape != self.local_detector.state_dict()[k].shape:
+                    raise RuntimeError(
+                        f"检测器参数形状不匹配: {k} {v.shape} vs {self.local_detector.state_dict()[k].shape}")
+
             self.local_detector.load_state_dict(global_params["detector"])
             self.local_recognizer.load_state_dict(global_params["recognizer"])
         except RuntimeError as e:
             print(f"参数加载失败: {str(e)}")
             return None
 
-        # 初始化优化器和损失函数
+        # 优化器配置（增加梯度累积）
         optimizer = torch.optim.AdamW(
             filter(lambda p: p.requires_grad, self.local_recognizer.parameters()),
             lr=1e-4,
             weight_decay=1e-5
         )
-        ctc_loss = nn.CTCLoss(blank=0)  # blank对应空白标签
-        color_criterion = nn.CrossEntropyLoss()
+        criterion = nn.CrossEntropyLoss()
+        grad_accum_steps = 4  # 梯度累积步数
 
         try:
             for epoch in range(epochs):
@@ -140,65 +154,53 @@ class FedClient:
 
                     for idx in range(len(images)):
                         try:
-                            # ROI提取
+                            # ROI提取（改进后的对齐方案）
                             roi = self._safe_extract_roi(images[idx], bboxes[idx])
                             if roi is None:
                                 continue
 
-                            # 预处理
+                            # 预处理流水线优化
                             with torch.cuda.amp.autocast():
                                 processed_img = image_processing(roi, self.device)
                                 if processed_img.dim() == 3:
                                     processed_img = processed_img.unsqueeze(0)
 
+                                # 形状校验
+                                if processed_img.shape[2:] != (48, 168):
+                                    continue
+
                                 # 前向传播
-                                plate_logits, color_logits = self.local_recognizer(processed_img)
+                                with torch.cuda.amp.autocast():
+                                    plate_logits, color_logits = self.local_recognizer(processed_img)
 
-                                # 调试输出
-                                print(f"[Pre] Plate logits shape: {plate_logits.shape}")
+                                    # 确保输出形状为 [batch=1, seq=8, classes=78]
+                                    plate_logits = plate_logits.permute(1, 0, 2)  # 调整维度顺序
+                                    if plate_logits.size(0) < 8:
+                                        plate_logits = nn.functional.pad(plate_logits,
+                                                                         (0, 0, 0, 0, 0, 8 - plate_logits.size(0)))
+                                    elif plate_logits.size(0) > 8:
+                                        plate_logits = plate_logits[:8]
 
-                                # 调整CTCLoss需要的维度
-                                if plate_logits.dim() == 2:  # [T,C]
-                                    plate_logits = plate_logits.unsqueeze(1)  # [T,1,C]
-                                plate_logits = plate_logits.permute(1, 0, 2)  # [N,T,C]
+                                # =============== 目标张量处理 =============== #
+                                target_indices = self._str_to_indices(plate_numbers[idx])
+                                target_indices = target_indices.unsqueeze(0)  # 添加batch维度 [1,8]
 
-                                # 强制序列长度为8
-                                T = plate_logits.size(1)
-                                if T < 8:
-                                    plate_logits = torch.nn.functional.pad(plate_logits, (0, 0, 0, 8 - T, 0, 0))
-                                elif T > 8:
-                                    plate_logits = plate_logits[:, :8, :]
+                                # =============== CTCLoss参数构造 =============== #
+                                input_lengths = torch.full((1,), 8, dtype=torch.long, device=self.device)
+                                target_lengths = torch.full((1,), 8, dtype=torch.long, device=self.device)
 
-                                # 转换为log_softmax
-                                plate_logits = torch.log_softmax(plate_logits, dim=2)
-                                print(f"[Post] Plate logits shape: {plate_logits.shape}")
+                                # =============== 损失计算 =============== #
+                                plate_loss = self.ctc_loss(
+                                    plate_logits.log_softmax(2),  # 需要log_softmax输入
+                                    target_indices,
+                                    input_lengths,
+                                    target_lengths
+                                )
 
-                            # 生成目标序列
-                            target_indices = self._str_to_indices(plate_numbers[idx]).unsqueeze(0)  # [1,8]
-                            print(f"Target indices shape: {target_indices.shape}")
-
-                            # 计算CTCLoss
-                            input_lengths = torch.full((1,), 8, dtype=torch.long, device=self.device)
-                            target_lengths = torch.full((1,), 8, dtype=torch.long, device=self.device)
-
-                            plate_loss = ctc_loss(
-                                plate_logits,  # [N,T,C] = [1,8,78]
-                                target_indices,  # [N,S] = [1,8]
-                                input_lengths,
-                                target_lengths
-                            )
-
-                            # 颜色分类损失
-                            color_loss = self._calc_color_loss(color_logits, plate_colors[idx])
-
-                            # 总损失
-                            total_loss = plate_loss + 0.5 * color_loss
-                            batch_loss += total_loss.item()
+                            # 梯度累积
+                            (loss / grad_accum_steps).backward()
+                            batch_loss += loss.item()
                             valid_samples += 1
-
-                            # 反向传播
-                            (total_loss / 4).backward()  # 假设梯度累积步数为4
-                            torch.nn.utils.clip_grad_norm_(self.local_recognizer.parameters(), max_norm=1.0)
 
                             # 及时释放内存
                             del processed_img, plate_logits, color_logits
@@ -209,23 +211,25 @@ class FedClient:
                             continue
 
                     if valid_samples > 0:
-                        # 参数更新
-                        if (batch_idx + 1) % 4 == 0:
+                        # 梯度裁剪和参数更新
+                        torch.nn.utils.clip_grad_norm_(self.local_recognizer.parameters(), max_norm=1.0)
+                        if (batch_idx + 1) % grad_accum_steps == 0:
                             optimizer.step()
                             optimizer.zero_grad()
 
-                        # 统计损失
+                        # 损失统计
                         avg_batch_loss = batch_loss / valid_samples
                         total_loss += avg_batch_loss
                         valid_batches += 1
 
-                    # 定期显存清理
-                    if batch_idx % 2 == 0 and torch.cuda.is_available():
+                    # 显存维护
+                    if batch_idx % 2 == 0:
                         torch.cuda.empty_cache()
 
                 if valid_batches > 0:
                     avg_epoch_loss = total_loss / valid_batches
-                    print(f"Client {self.client_id} Epoch {epoch + 1} | Loss: {avg_epoch_loss:.4f}")
+                    print(
+                        f"Client {self.client_id} Epoch {epoch + 1} | Loss: {avg_epoch_loss:.4f} | Samples: {valid_samples}")
 
         except RuntimeError as e:
             print(f"训练异常: {str(e)}")
@@ -236,7 +240,7 @@ class FedClient:
             # 资源清理
             self.local_detector.to('cpu')
             self.local_recognizer.to('cpu')
-            del optimizer, ctc_loss, color_criterion
+            del optimizer, criterion
             torch.cuda.empty_cache()
 
         return {
@@ -343,18 +347,26 @@ class FedClient:
         return loss
 
     def _str_to_indices(self, target_str):
-        """生成符合CTCLoss要求的target tensor"""
+        """增强版目标序列生成"""
         max_length = 8
         indices = []
+        valid_chars = 0
         for char in target_str[:max_length]:
-            indices.append(plateName.index(char) if char in plateName else 0)
-        indices += [0] * (max_length - len(indices))
-        return torch.tensor(indices, device=self.device, dtype=torch.long)  # 保持为1D [8]
+            if char in plateName:
+                indices.append(plateName.index(char))
+                valid_chars += 1
+            else:
+                indices.append(0)
 
-    # 在计算CTCLoss前调整target格式
-    target_indices = self._str_to_indices(plate_numbers[idx])
-    target_indices = target_indices.view(1, -1)  # 显式转为2D [1,8]
-    
+        # 填充剩余位置
+        indices += [0] * (max_length - len(indices))
+
+        # 添加有效性校验
+        if valid_chars == 0:
+            return None  # 触发跳过当前样本
+
+        return torch.tensor(indices, dtype=torch.long, device=self.device)
+
     def _validate_batch(self, batch):
         """增强校验逻辑"""
         required_keys = ['image', 'bbox', 'plate_number', 'plate_color']
