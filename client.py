@@ -20,21 +20,18 @@ class FedClient:
         self.client_id = client_id
         self.server = server
 
-        # 检测模型只用于推理
         self.local_detector = load_model("weights/yolov8s.pt", self.device)
         self.local_recognizer = init_model(self.device, "weights/plate_rec_color.pth", is_color=True)
 
-        # 数据集
         self.dataset = PlateDataset(data_root, client_id=client_id, mode='train')
-        self.loader = DataLoader(self.dataset, batch_size=8, shuffle=True, num_workers=0, collate_fn=collate_fn)
+        self.loader = DataLoader(self.dataset, batch_size=16, shuffle=True, num_workers=0, collate_fn=collate_fn)
 
-    def local_train(self, epochs=1):
-        # 同步识别器参数
+    def local_train(self, epochs=5):
         global_params = self.server.get_global_models()
         self.local_recognizer.load_state_dict(global_params["recognizer"])
 
         optimizer = torch.optim.Adam(self.local_recognizer.parameters(), lr=1e-4)
-        criterion_plate = nn.CTCLoss(blank=0)
+        criterion_plate = nn.CTCLoss(blank=0, zero_infinity=True)
         criterion_color = nn.CrossEntropyLoss()
         for epoch in range(epochs):
             self.local_recognizer.train()
@@ -59,18 +56,25 @@ class FedClient:
                 if not imgs:
                     continue
                 imgs = torch.cat(imgs, dim=0)
-                input_lengths = torch.full((len(imgs),), 18, dtype=torch.long, device=self.device)  # 假定最大长度
+                input_lengths = torch.full((len(imgs),), imgs.shape[-1] // 8, dtype=torch.long, device=self.device)  # 推断长度
                 target_concat = torch.cat(targets)
                 target_lengths = torch.tensor([len(t) for t in targets], dtype=torch.long, device=self.device)
                 color_targets = torch.tensor(colors, dtype=torch.long, device=self.device)
                 logits, color_logits = self.local_recognizer(imgs)
-                # logits shape: (batch, seq_len, num_class) or (seq_len, batch, num_class)
-                # 这里假定输出为 (batch, seq_len, num_class)，需转为 (seq_len, batch, num_class)
                 if logits.dim() == 3:
-                    logits = logits.permute(1,0,2)
-                loss_plate = criterion_plate(logits.log_softmax(2), target_concat, input_lengths, target_lengths)
-                loss_color = criterion_color(color_logits, color_targets)
-                loss = loss_plate + loss_color
+                    logits = logits.permute(1, 0, 2)
+                try:
+                    loss_plate = criterion_plate(logits.log_softmax(2), target_concat, input_lengths, target_lengths)
+                    loss_color = criterion_color(color_logits, color_targets)
+                    loss = loss_plate + loss_color
+                except Exception as e:
+                    print(f"[ERROR] Loss computation error: {e}")
+                    continue
+                if loss.item() < 0:
+                    print(f"[WARN] Negative loss detected! Skipping batch. Details:")
+                    print(f"imgs.shape: {imgs.shape}, targets: {targets}, color_targets: {colors}")
+                    print(f"logits.shape: {logits.shape}, input_lengths: {input_lengths}, target_lengths: {target_lengths}")
+                    continue
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
@@ -78,11 +82,11 @@ class FedClient:
                 valid_batches += 1
             print(f"Client {self.client_id} Epoch {epoch+1} Loss: {epoch_loss/(valid_batches or 1):.4f}")
         return {
-            "recognizer": copy.deepcopy(self.local_recognizer.state_dict())
+            "recognizer": copy.deepcopy(self.local_recognizer.state_dict()),
+            "num_samples": len(self.dataset)
         }
 
     def _str_to_indices(self, s):
-        # 按 plate_rec.py 的 plateName 字典映射
         plateName = "#京沪津渝冀晋蒙辽吉黑苏浙皖闽赣鲁豫鄂湘粤桂琼川贵云藏陕甘青宁新学警港澳挂使领民航危0123456789ABCDEFGHJKLMNPQRSTUVWXYZ险品"
         idxs = [plateName.index(ch) if ch in plateName else 0 for ch in s]
         return torch.tensor(idxs, dtype=torch.long, device=self.device)
