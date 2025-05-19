@@ -1,71 +1,58 @@
 import os
 import cv2
-import numpy as np
+import torch
 from torch.utils.data import Dataset
 
-def cv_imread(path):
-    img = cv2.imdecode(np.fromfile(path, dtype=np.uint8), -1)
-    return img
-
 class PlateDataset(Dataset):
-    def __init__(self, data_root, client_id=None, mode='train'):
-        self.samples = []
+    def __init__(self, root, client_id=None, mode="train"):
+        self.root = root
+        self.mode = mode
+        self.img_paths = []
+        self.label_paths = []
+
+        # 客户端
         if client_id is not None:
-            root = os.path.join(data_root, f"client_{client_id}")
+            data_folder = os.path.join(root, f"client_{client_id}")
         else:
-            root = os.path.join(data_root, mode)
-        self._load_samples(root)
+            data_folder = os.path.join(root, mode)
+        images_dir = os.path.join(data_folder, "images")
+        labels_dir = os.path.join(data_folder, "labels")
 
-    def _load_samples(self, root):
-        images_dir = os.path.join(root, "images")
-        labels_dir = os.path.join(root, "labels")
-        if not os.path.isdir(images_dir) or not os.path.isdir(labels_dir):
-            print(f"[WARN] {images_dir} or {labels_dir} not found!")
-            return
-        for fname in os.listdir(images_dir):
-            if not fname.lower().endswith(('.jpg', '.png', '.jpeg')):
-                continue
-            img_path = os.path.join(images_dir, fname)
-            label_path = os.path.join(labels_dir, os.path.splitext(fname)[0] + ".txt")
-            if not os.path.exists(label_path):
-                continue
-            try:
-                with open(label_path, 'r', encoding='utf-8') as f:
-                    lines = [line.strip() for line in f.readlines()]
-                    if len(lines) < 3:
-                        continue
-                    _, x_c, y_c, w, h = map(float, lines[0].split())
-                    img = cv_imread(img_path)
-                    if img is None:
-                        continue
-                    h_img, w_img = img.shape[:2]
-                    x_c, y_c, w, h = x_c * w_img, y_c * h_img, w * w_img, h * h_img
-                    x1 = int(x_c - w / 2)
-                    y1 = int(y_c - h / 2)
-                    x2 = int(x_c + w / 2)
-                    y2 = int(y_c + h / 2)
-                    bbox = [max(0, x1), max(0, y1), min(w_img, x2), min(h_img, y2)]
-                    plate_number = lines[1]
-                    plate_color = lines[2]
-                    self.samples.append({
-                        'image_path': img_path,
-                        'bbox': bbox,
-                        'plate_number': plate_number,
-                        'plate_color': plate_color
-                    })
-            except Exception as e:
-                print(f"[ERROR] Parse {label_path}: {e}")
-
-    def __getitem__(self, idx):
-        sample = self.samples[idx]
-        img = cv_imread(sample['image_path'])
-        return {
-            'image': img,
-            'bbox': sample['bbox'],
-            'plate_number': sample['plate_number'],
-            'plate_color': sample['plate_color'],
-            'image_path': sample['image_path']
-        }
+        for fname in sorted(os.listdir(labels_dir)):
+            if fname.endswith('.txt'):
+                base = fname[:-4]
+                img_path = os.path.join(images_dir, base + ".jpg")
+                if not os.path.exists(img_path):
+                    img_path = os.path.join(images_dir, base + ".png")
+                if not os.path.exists(img_path):
+                    continue
+                self.img_paths.append(img_path)
+                self.label_paths.append(os.path.join(labels_dir, fname))
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.img_paths)
+
+    def __getitem__(self, idx):
+        img_path = self.img_paths[idx]
+        label_path = self.label_paths[idx]
+        img = cv2.imread(img_path)
+        with open(label_path, "r", encoding="utf-8") as f:
+            lines = [l.strip() for l in f.readlines()]
+            class_info = lines[0].split()
+            x, y, w, h = map(float, class_info[1:5]) # YOLO格式
+            plate_number = lines[1]
+            plate_color = lines[2]
+        H, W = img.shape[:2]
+        x1 = int((x - w / 2) * W)
+        y1 = int((y - h / 2) * H)
+        x2 = int((x + w / 2) * W)
+        y2 = int((y + h / 2) * H)
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(W, x2), min(H, y2)
+        return {
+            "image": img,
+            "bbox": (x1, y1, x2, y2),
+            "plate_number": plate_number,
+            "plate_color": plate_color,
+            "img_path": img_path
+        }

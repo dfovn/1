@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 from torch import nn
 from torch.utils.data import DataLoader
-from plate_recognition.plate_rec import image_processing, get_plate_result
+from plate_recognition.plate_rec import image_processing
 from utils import PlateDataset
 from detect_rec_plate import load_model
 from plate_recognition.plate_rec import init_model
@@ -22,9 +22,11 @@ class FedClient:
 
         self.local_detector = load_model("weights/yolov8s.pt", self.device)
         self.local_recognizer = init_model(self.device, "weights/plate_rec_color.pth", is_color=True)
-
         self.dataset = PlateDataset(data_root, client_id=client_id, mode='train')
-        self.loader = DataLoader(self.dataset, batch_size=16, shuffle=True, num_workers=0, collate_fn=collate_fn)
+        self.loader = DataLoader(self.dataset, batch_size=8, shuffle=True, num_workers=0, collate_fn=collate_fn) # batch=8更稳定
+
+        self.plateName = "#京沪津渝冀晋蒙辽吉黑苏浙皖闽赣鲁豫鄂湘粤桂琼川贵云藏陕甘青宁新学警港澳挂使领民航危0123456789ABCDEFGHJKLMNPQRSTUVWXYZ险品"
+        self.color_map = {'黑色': 0, '蓝色': 1, '绿色': 2, '白色': 3, '黄色': 4}
 
     def local_train(self, epochs=5):
         global_params = self.server.get_global_models()
@@ -38,7 +40,7 @@ class FedClient:
             epoch_loss = 0.0
             valid_batches = 0
             for batch in self.loader:
-                imgs, targets, colors = [], [], []
+                imgs, targets, colors, target_lens = [], [], [], []
                 for item in batch:
                     img = item["image"]
                     x1, y1, x2, y2 = item["bbox"]
@@ -50,30 +52,36 @@ class FedClient:
                     elif roi.shape[2] == 4:
                         roi = roi[:, :, :3]
                     processed = image_processing(roi, self.device)
+                    idxs = self._str_to_indices(item["plate_number"])
                     imgs.append(processed)
-                    targets.append(self._str_to_indices(item["plate_number"]))
+                    targets.append(idxs)
                     colors.append(self._color_to_idx(item["plate_color"]))
+                    target_lens.append(len(idxs))
                 if not imgs:
                     continue
                 imgs = torch.cat(imgs, dim=0)
-                input_lengths = torch.full((len(imgs),), imgs.shape[-1] // 8, dtype=torch.long, device=self.device)  # 推断长度
-                target_concat = torch.cat(targets)
-                target_lengths = torch.tensor([len(t) for t in targets], dtype=torch.long, device=self.device)
-                color_targets = torch.tensor(colors, dtype=torch.long, device=self.device)
                 logits, color_logits = self.local_recognizer(imgs)
+                # logits: [batch, width, num_classes], for ctc needs [T, N, C]
                 if logits.dim() == 3:
-                    logits = logits.permute(1, 0, 2)
+                    logits = logits.permute(1, 0, 2)  # [width, batch, num_classes]
+                else:
+                    raise RuntimeError("Unexpected logits shape")
+
+                # CTC Loss 需要 target 是 1D
+                targets_1d = torch.cat(targets)
+                input_lengths = torch.full((imgs.shape[0],), logits.size(0), dtype=torch.long, device=self.device)
+                target_lengths = torch.tensor(target_lens, dtype=torch.long, device=self.device)
+                color_targets = torch.tensor(colors, dtype=torch.long, device=self.device)
+
                 try:
-                    loss_plate = criterion_plate(logits.log_softmax(2), target_concat, input_lengths, target_lengths)
+                    loss_plate = criterion_plate(logits.log_softmax(2), targets_1d, input_lengths, target_lengths)
                     loss_color = criterion_color(color_logits, color_targets)
                     loss = loss_plate + loss_color
                 except Exception as e:
                     print(f"[ERROR] Loss computation error: {e}")
                     continue
-                if loss.item() < 0:
-                    print(f"[WARN] Negative loss detected! Skipping batch. Details:")
-                    print(f"imgs.shape: {imgs.shape}, targets: {targets}, color_targets: {colors}")
-                    print(f"logits.shape: {logits.shape}, input_lengths: {input_lengths}, target_lengths: {target_lengths}")
+                if not torch.isfinite(loss) or loss.item() < 0:
+                    print(f"[WARN] Negative or NaN loss detected! Skipping batch.")
                     continue
                 optimizer.zero_grad()
                 loss.backward()
@@ -87,10 +95,15 @@ class FedClient:
         }
 
     def _str_to_indices(self, s):
-        plateName = "#京沪津渝冀晋蒙辽吉黑苏浙皖闽赣鲁豫鄂湘粤桂琼川贵云藏陕甘青宁新学警港澳挂使领民航危0123456789ABCDEFGHJKLMNPQRSTUVWXYZ险品"
-        idxs = [plateName.index(ch) if ch in plateName else 0 for ch in s]
+        # blank=0，字符索引需从1开始
+        idxs = []
+        for ch in s:
+            if ch in self.plateName:
+                idx = self.plateName.index(ch)
+                idxs.append(idx)
+            else:
+                idxs.append(0)
         return torch.tensor(idxs, dtype=torch.long, device=self.device)
 
     def _color_to_idx(self, color):
-        color_map = {'黑色': 0, '蓝色': 1, '绿色': 2, '白色': 3, '黄色': 4}
-        return color_map.get(color, 0)
+        return self.color_map.get(color, 0)
