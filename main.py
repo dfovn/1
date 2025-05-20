@@ -7,11 +7,11 @@ from utils import PlateDataset
 
 def main():
     server = FedServer()
-    clients = [FedClient(i, './ccpd2019', server) for i in range(5)]
-    test_set = PlateDataset('./ccpd2019', mode='test')
+    clients = [FedClient(i, './iid', server) for i in range(3)]
+    test_set = PlateDataset('./iid', mode='test')
 
     num_rounds = 50
-    local_epochs = 5
+    local_epochs = 3
     log_file = open("fed_log.txt", "w")
     for round in range(num_rounds):
         start_time = time.time()
@@ -23,7 +23,14 @@ def main():
         server.aggregate(updates)
         acc = server.evaluate(test_set)
         time_cost = time.time() - start_time
-        log_str = f"Round {round + 1}, Acc: {acc:.2%}, Time: {time_cost:.1f}s\n"
+        # 新增：分开输出各指标
+        log_str = (
+            f"Round {round + 1}, "
+            f"FullAcc: {acc['full_accuracy']:.2%}, "
+            f"CharAcc: {acc['char_accuracy']:.2%}, "
+            f"ColorAcc: {acc['color_accuracy']:.2%}, "
+            f"Time: {time_cost:.1f}s\n"
+        )
         print(log_str)
         log_file.write(log_str)
         if (round + 1) % 5 == 0:
