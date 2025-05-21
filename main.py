@@ -7,11 +7,11 @@ from utils import PlateDataset
 
 def main():
     server = FedServer()
-    clients = [FedClient(i, './iid', server) for i in range(3)]
+    clients = [FedClient(i, './iid', server) for i in range(5)]
     test_set = PlateDataset('./iid', mode='test')
 
     num_rounds = 50
-    local_epochs = 3
+    local_epochs = 1
     log_file = open("fed_log.txt", "w")
     for round in range(num_rounds):
         start_time = time.time()
