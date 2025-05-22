@@ -8,9 +8,12 @@ from torch import nn
 from torch.utils.data import DataLoader
 from plate_recognition.plate_rec import image_processing
 from utils import PlateDataset
-from detect_rec_plate import load_model
 from plate_recognition.plate_rec import init_model
+from ultralytics.nn.tasks import attempt_load_weights
 
+def load_model(weights, device):  # 加载yolov8 模型
+    model = attempt_load_weights(weights, device=device)  # load FP32 model
+    return model
 def collate_fn(batch):
     return batch
 
