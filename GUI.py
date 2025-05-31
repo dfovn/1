@@ -9,7 +9,7 @@ from detect_rec_plate import load_model, det_rec_plate, draw_result
 # 初始化模型
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 detect_model = load_model(r"weights/yolov8s.pt", device)
-plate_rec_model = init_model(device, 'weights/plate_rec_color.pth', is_color=True)
+plate_rec_model = init_model(device, 'models/recognizer_round50.pt', is_color=True)
 
 
 class App:
